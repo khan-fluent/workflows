@@ -1,0 +1,102 @@
+name: Reusable — ECS Deploy
+
+# Reusable workflow that builds a Docker image, pushes to ECR, and rolls out
+# a new ECS task definition. Used by all khan-fluent app repos.
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        description: AWS region
+        type: string
+        default: us-east-1
+      ecr_repository:
+        description: ECR repository name
+        type: string
+        required: true
+      ecs_cluster:
+        description: ECS cluster name
+        type: string
+        required: true
+      ecs_service:
+        description: ECS service name
+        type: string
+        required: true
+      task_definition_family:
+        description: Task definition family (defaults to ecs_service)
+        type: string
+        default: ''
+      container_name:
+        description: Container name in task definition (defaults to ecs_service)
+        type: string
+        default: ''
+      dockerfile_context:
+        description: Docker build context path
+        type: string
+        default: '.'
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build & Deploy to ECS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            ${{ inputs.dockerfile_context }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Download current task definition
+        env:
+          TASK_FAMILY: ${{ inputs.task_definition_family != '' && inputs.task_definition_family || inputs.ecs_service }}
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --query taskDefinition \
+            > task-definition.json
+
+      - name: Render new task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ inputs.container_name != '' && inputs.container_name || inputs.ecs_service }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ inputs.ecs_service }}
+          cluster: ${{ inputs.ecs_cluster }}
+          wait-for-service-stability: true

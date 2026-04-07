@@ -1,0 +1,63 @@
+name: Reusable — Node CI
+
+# Reusable workflow that lints, builds, and verifies a Node app
+# with the standard `app/{client,server}` layout.
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: Node version
+        type: string
+        default: '20'
+      docker_image_tag:
+        description: Local docker image tag for the smoke build
+        type: string
+        default: app-test
+      build_client:
+        description: Whether to npm install + build the client
+        type: boolean
+        default: true
+      build_server:
+        description: Whether to npm install the server
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-build:
+    name: Lint & Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: |
+            app/client/package-lock.json
+            app/server/package-lock.json
+
+      - name: Install + build client
+        if: ${{ inputs.build_client }}
+        working-directory: app/client
+        run: |
+          npm ci || npm install
+          npm run build
+
+      - name: Install server
+        if: ${{ inputs.build_server }}
+        working-directory: app/server
+        run: npm ci || npm install
+
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t ${{ inputs.docker_image_tag }} .
