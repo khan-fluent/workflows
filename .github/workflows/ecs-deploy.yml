@@ -68,12 +68,14 @@ jobs:
           ECR_REPOSITORY: ${{ inputs.ecr_repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          # We deliberately do NOT push :latest. Old task definition revisions
+          # that reference :latest can pull whatever the ECS agent has cached
+          # locally, making rollbacks unpredictable. By only pushing immutable
+          # SHA tags, every task definition pins exactly one image digest.
           docker build \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
             ${{ inputs.dockerfile_context }}
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
       - name: Download current task definition
@@ -94,9 +96,70 @@ jobs:
           image: ${{ steps.build-image.outputs.image }}
 
       - name: Deploy to ECS
+        id: ecs-deploy
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
           service: ${{ inputs.ecs_service }}
           cluster: ${{ inputs.ecs_cluster }}
           wait-for-service-stability: true
+
+      - name: Verify rollout matches deployed revision
+        env:
+          CLUSTER: ${{ inputs.ecs_cluster }}
+          SERVICE: ${{ inputs.ecs_service }}
+          EXPECTED_TD: ${{ steps.ecs-deploy.outputs.task-definition-arn }}
+        run: |
+          # Defense against silent rollback: the ECS deployment circuit breaker
+          # can roll back to a previous task definition if new tasks fail to
+          # start, while wait-for-service-stability still reports success
+          # (because *some* task is running, just not the one we deployed).
+          # We explicitly assert that the PRIMARY deployment's task definition
+          # matches what we just rendered, and that rolloutState is COMPLETED.
+
+          PRIMARY=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].deployments[?status==`PRIMARY`] | [0]' \
+            --output json)
+
+          PRIMARY_TD=$(echo "$PRIMARY" | jq -r '.taskDefinition')
+          PRIMARY_STATE=$(echo "$PRIMARY" | jq -r '.rolloutState')
+          PRIMARY_REASON=$(echo "$PRIMARY" | jq -r '.rolloutStateReason')
+          PRIMARY_RUNNING=$(echo "$PRIMARY" | jq -r '.runningCount')
+          PRIMARY_DESIRED=$(echo "$PRIMARY" | jq -r '.desiredCount')
+
+          echo "Expected task definition: $EXPECTED_TD"
+          echo "PRIMARY task definition:  $PRIMARY_TD"
+          echo "PRIMARY rolloutState:     $PRIMARY_STATE ($PRIMARY_REASON)"
+          echo "PRIMARY tasks:            $PRIMARY_RUNNING / $PRIMARY_DESIRED"
+
+          FAILED=0
+
+          if [ "$PRIMARY_TD" != "$EXPECTED_TD" ]; then
+            echo "::error::Deployment rolled back. PRIMARY is on $PRIMARY_TD but we deployed $EXPECTED_TD."
+            FAILED=1
+          fi
+
+          if [ "$PRIMARY_STATE" != "COMPLETED" ]; then
+            echo "::error::PRIMARY rolloutState is $PRIMARY_STATE, expected COMPLETED."
+            FAILED=1
+          fi
+
+          if [ "$PRIMARY_RUNNING" -lt "$PRIMARY_DESIRED" ]; then
+            echo "::error::Only $PRIMARY_RUNNING / $PRIMARY_DESIRED tasks running."
+            FAILED=1
+          fi
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo ""
+            echo "Recent service events (most recent first):"
+            aws ecs describe-services \
+              --cluster "$CLUSTER" \
+              --services "$SERVICE" \
+              --query 'services[0].events[0:10].[createdAt,message]' \
+              --output table
+            exit 1
+          fi
+
+          echo "✅ Deployment verified: $EXPECTED_TD is live."
